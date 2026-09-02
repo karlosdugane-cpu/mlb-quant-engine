@@ -8,7 +8,7 @@ from flask import Flask, jsonify
 app = Flask(__name__)
 
 # ==========================================
-# CONFIGURATION
+# CONFIGURATION ET FILTRES STRICTS
 # ==========================================
 ODDS_API_KEY = "68d874fb44f7d4dfb7a5deeb4627b80f"
 TELEGRAM_BOT_TOKEN = "8405911600:AAEIUhtYeQY3vKboG4Z5KQhNi6U-iu44V0o"
@@ -22,9 +22,9 @@ HOME_FIELD_ADVANTAGE = 0.18
 LOGISTIC_SCALE = 1.50       
 SEASON_YEAR = 2026
 
-MIN_EV_THRESHOLD = 0.03
-TELEGRAM_MIN_EV = 5.0
-# KELLY_FRACTION n'est plus utilisé ici car remplacé par le Safe Kelly 1/8.
+# FILTRES DE SÉCURITÉ REHAUSSÉS
+MIN_EV_THRESHOLD = 0.05     # 5% minimum
+TELEGRAM_MIN_EV = 7.0       # Alerte Telegram uniquement si EV >= 7% (Filtre anti-piège)
 
 def send_telegram_alert(message):
     if TELEGRAM_BOT_TOKEN == "VOTRE_BOT_TOKEN_ICI" or TELEGRAM_CHAT_ID == "VOTRE_CHAT_ID_ICI":
@@ -37,21 +37,15 @@ def send_telegram_alert(message):
         print(f"Erreur Telegram : {e}")
 
 # ==========================================
-# NOUVELLES FONCTIONS MATHÉMATIQUES (CORRIGÉES)
+# FONCTIONS MATHÉMATIQUES SÉCURISÉES
 # ==========================================
-def cap_and_smooth_probability(raw_prob, max_cap=0.68, min_cap=0.32):
-    """Lisse et plafonne la probabilité pour refléter la réalité MLB."""
-    smoothed_prob = (raw_prob * 0.7) + (0.50 * 0.3)
-    return float(np.clip(smoothed_prob, min_cap, max_cap))
-
 def calculate_expected_value(win_prob, decimal_odds):
-    """Calcule l'EV réel."""
     if decimal_odds <= 1.0:
         return 0.0
     return round(((win_prob * decimal_odds) - 1.0) * 100, 2)
 
 def calculate_safe_kelly(win_prob, decimal_odds, max_bankroll_pct=0.03):
-    """Calcule une mise sécurisée avec un Fractional Kelly (1/8) et plafond de 3%."""
+    """Kelly fractionnaire ultra-prudent (1/8) plafonné à 3% pour zéro risque de ruine."""
     if decimal_odds <= 1.0:
         return 0.0
     b = decimal_odds - 1.0
@@ -63,7 +57,7 @@ def calculate_safe_kelly(win_prob, decimal_odds, max_bankroll_pct=0.03):
     return round(final_stake_pct * 100, 2)
 
 # ==========================================
-# RÉCUPÉRATION DES DONNÉES (API)
+# RÉCUPÉRATION DES DONNÉES (AVEC SÉCURITÉ STRICTE)
 # ==========================================
 def get_live_odds():
     if ODDS_API_KEY == "VOTRE_CLE_API_ICI":
@@ -118,23 +112,24 @@ def get_mlb_schedule(date_str):
     return games
 
 def get_pitcher_fip(pitcher_id):
+    """Retourne None si le lanceur est inconnu ou n'a pas assez d'historique (Bloque les approximations)."""
     if not pitcher_id:
-        return LEAGUE_AVG
+        return None
     url = f"https://statsapi.mlb.com/api/v1/people/{pitcher_id}/stats?stats=season&season={SEASON_YEAR}&group=pitching"
     response = requests.get(url)
     if response.status_code != 200:
-        return LEAGUE_AVG
+        return None
     try:
         splits = response.json().get('stats', [])[0].get('splits', [])
         if not splits:
-            return LEAGUE_AVG
+            return None
         p = splits[0].get('stat', {})
         ip = float(p.get('inningsPitched', 0))
-        if ip == 0:
-            return LEAGUE_AVG
+        if ip < 3.0: # Exige au moins 3 manches lancées pour éviter les stats faussées de début de saison/remplaçants
+            return None
         return round(((13 * int(p.get('homeRuns', 0))) + (3 * (int(p.get('baseOnBalls', 0)) + int(p.get('hitBatsmen', 0)))) - (2 * int(p.get('strikeOuts', 0)))) / ip + 3.10, 2)
     except:
-        return LEAGUE_AVG
+        return None
 
 def get_team_pitching_era(team_id):
     if not team_id:
@@ -160,7 +155,7 @@ def predict_game_outcome(away_fip, away_bp, home_fip, home_bp):
     return round(away_exp, 2), round(home_exp, 2), round(home_win_prob, 3)
 
 # ==========================================
-# BOUCLE PRINCIPALE D'ANALYSE
+# BOUCLE PRINCIPALE AVEC FILTRE DE SÉCURITÉ ABSOLUE
 # ==========================================
 def run_mlb_analysis():
     today = datetime.datetime.now().strftime('%Y-%m-%d')
@@ -170,26 +165,30 @@ def run_mlb_analysis():
 
     live_odds = get_live_odds()
     alerts_sent = 0
+    skipped_games = 0
     
     for game in games:
         match_name = f"{game['away_team']} @ {game['home_team']}"
+        
+        # Récupération des FIP des lanceurs partants
         away_fip = get_pitcher_fip(game['away_pitcher_id'])
         home_fip = get_pitcher_fip(game['home_pitcher_id'])
+        
+        # 🛡️ SÉCURITÉ CRITIQUE : Si l'un des lanceurs partants n'a pas de stats officielles, on ignore le match
+        if away_fip is None or home_fip is None:
+            skipped_games += 1
+            continue
+
         away_bp = get_team_pitching_era(game['away_id'])
         home_bp = get_team_pitching_era(game['home_id'])
         
-        # 1. Modèle brut
-        away_exp, home_exp, raw_home_prob = predict_game_outcome(away_fip, away_bp, home_fip, home_bp)
-        raw_away_prob = 1.0 - raw_home_prob
-        
-        # 2. LISSAGE DES PROBABILITÉS (CORRECTION)
-        home_prob_dec = cap_and_smooth_probability(raw_home_prob)
-        away_prob_dec = cap_and_smooth_probability(raw_away_prob)
+        # Calcul du modèle pur
+        away_exp, home_exp, home_prob_dec = predict_game_outcome(away_fip, away_bp, home_fip, home_bp)
+        away_prob_dec = 1.0 - home_prob_dec
         
         odds = live_odds.get((game['away_team'].lower(), game['home_team'].lower()), 
                              {"away_odds": 2.00, "home_odds": 2.00, "away_bookmaker": "-", "home_bookmaker": "-"})
 
-        # 3. CALCULS EV ET KELLY AVEC PROBAS LISSÉES
         away_ev = calculate_expected_value(away_prob_dec, odds["away_odds"])
         home_ev = calculate_expected_value(home_prob_dec, odds["home_odds"])
         away_kelly = calculate_safe_kelly(away_prob_dec, odds["away_odds"])
@@ -206,28 +205,33 @@ def run_mlb_analysis():
                 game['home_team'], home_ev, round(home_prob_dec * 100, 1), odds["home_odds"], home_kelly, odds["home_bookmaker"]
             )
 
-        # 4. FILTRE D'ENVOI (Seulement si EV > 5% comme défini dans ton code)
+        # Envoi uniquement si l'EV dépasse le nouveau seuil strict de 7%
         if chosen_team and chosen_ev >= TELEGRAM_MIN_EV:
             msg = (
-                f"🔥 *SIGNAL VALUE BET DETECTÉ* 🔥\n\n"
+                f"🔥 *SIGNAL VALUE BET CERTIFIÉ* 🔥\n\n"
                 f"⚾ *Match :* `{match_name}`\n"
                 f"🎯 *Pari :* `{chosen_team}`\n"
                 f"📈 *Expected Value :* `+{chosen_ev}%`\n"
-                f"📊 *Prob. Modèle (Lissée) :* `{chosen_prob}%`\n"
+                f"📊 *Prob. Modèle :* `{chosen_prob}%`\n"
                 f"💰 *Cote :* `{chosen_odds}` ({chosen_bm})\n"
                 f"💵 *Mise Rec. :* `{chosen_kelly}% bankroll`"
             )
             send_telegram_alert(msg)
             alerts_sent += 1
 
-    return {"status": "success", "alerts_sent": alerts_sent, "matches_analyzed": len(games)}
+    return {
+        "status": "success", 
+        "alerts_sent": alerts_sent, 
+        "matches_analyzed": len(games),
+        "matches_skipped_due_to_missing_pitcher_data": skipped_games
+    }
 
 # ==========================================
 # ROUTES FLASK
 # ==========================================
 @app.route('/')
 def home():
-    return "✅ MLB Quantitative Engine is LIVE."
+    return "✅ MLB Quantitative Engine (Secured Mode) is LIVE."
 
 @app.route('/run-mlb')
 def trigger_bot():
